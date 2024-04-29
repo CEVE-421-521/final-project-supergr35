@@ -18,6 +18,13 @@ end
 """
 In this model, we only hvae one decision variable: how high to elevate the house.
 """
+struct SeqAction{T<:Float64}
+    buff::T
+    free::T 
+end
+function SeqAction(heights::T) where {T<:AbstractArray{Float64}}
+    return SeqAction(heights[1], heights[2])
+end
 struct Action{T<:Real}
     Δh_ft::T
 end
