@@ -1,6 +1,6 @@
 ---
 title: "Final Project Report"
-author: "Your Name (NetID)"
+author: "Grant Parajuli (gap6)"
 jupyter: julia-1.10
 date: 2024-04-30
 
@@ -12,18 +12,18 @@ date: 2024-04-30
 # https://quarto.org/docs/reference/formats/docx.html
 
 format: 
-    pdf:
-        documentclass: article
-        fontsize: 11pt
-        geometry:
-            - margin=1in  
-        number-sections: true
-        code-line-numbers: true
-    # docx: 
-    #    toc: true
-    #    fig-format: png
-    #    number-sections: true
-    #    code-line-numbers: true
+    # pdf:
+    #     documentclass: article
+    #     fontsize: 11pt
+    #     geometry:
+    #         - margin=1in  
+    #     number-sections: true
+    #     code-line-numbers: true
+    docx: 
+       toc: true
+       fig-format: png
+       number-sections: true
+       code-line-numbers: true
 
 date-format: "ddd., MMM. D"
 
@@ -42,19 +42,22 @@ execute:
 
 ## Problem Statement
 
-Clearly define the problem statement that your chosen feature aims to address.
-Explain the significance of this problem in the context of climate risk management.
+In our house elevation problem, we have considered approaches with a build policy that does not take into account new information over the course of the simulation. However, we expect future changes in storm surge and sea level rise due to climate change to be important non-stationary variables that may warrant deviation from a static build policy when discovering new information. Our current model only considers a static build policy, which is not representative of how people may decide whether to elevate their house or not given new information. A more realistic approach may consider the "present state" water level over the simulation and use that information to inform the decision of whether or not to elevate a house.
 
 ## Selected Feature
 
 Describe the feature you have selected to add to the existing decision-support tool.
 Discuss how this feature relates to the problem statement and its potential to improve climate risk assessment.
 
+I plan to implement an approach similar to @garner_slrise:2018 to simulate a build policy using a buffer height and freeboard height that respond to the current state of water level. I use an optimization approach with the buffer height and freeboard height as my decision variables and Net Present Value (NPV) as an objective function. A buffer height defines the acceptable minimum height of the house over the expected water level, while the freeboard height also adds some extra height to avoid the need to constantly elevate. My approach thus uses the current state of the expected water level to inform if an elevation is necessary. It's possible this might improve over a prescriptive elevation approach, but most importantly, it shows how a different decision making process affects our outcomes.
+
 # Literature Review
 
 Provide a brief overview of the theoretical background related to your chosen feature.
 Cite at least two relevant journal articles to support your approach (see [Quarto docs](https://quarto.org/docs/authoring/footnotes-and-citations.html) for help with citations).
 Explain how these articles contribute to the justification of your selected feature.
+
+This approach minimizes 2 objective functions: one for the investment cost of elevating our house, and one for the expected flooding damages. For my purposes, I will combine these into using NPV as an objective function as we have done in previous labs. State variables are the current state of sea level rise, and the decision variables are a buffer height and freeboard height, defined below
 
 # Methodology
 
@@ -64,12 +67,150 @@ You should make your modifications in either the `HouseElevation` or `ParkingGar
 Detail the steps taken to implement the selected feature and integrate it into the decision-support tool.
 Include code snippets and explanations where necessary to clarify the implementation process.
 
+All of modifications are in HouseElevation. First, I edited the House struct in house.jl to be mutable so that the height may change over time, as the actual elevation change will be based on the water level and house elevation at each time step. Second, I added a SeqAction struct in core.jl to describe the buffer and freeboard height policies that will be used in a sequential run. Lastly, I added a run_sim function that takes in a SeqAction struct, and that behaves differently than the non-sequential run_sim. This is described as follows:
+
+First, I calculate the expected value for storm surge, using the same samples from the storm surge distribution used in the original run_sim. Over each time step of the simulation, this value is added to the amount of sea level rise to get an expected water level for that time step. I then compare the difference between the height of the house and the expected water level with the buffer height. If the difference does not exceed the buffer height, then there is no elevation at that time step. If the buffer height is exceeded, then the heightening is equal to the freeboard height + the elevation required to reach the buffer height. Afterwards, run_sim updates the construction cost at each timestep based on the elevation required, and then calculates the expected flood damage. After iterating through all these timesteps, the discount rate is applied to all construction costs and expected annual damages and the NPV is returned.
+
+Additionally, in our original implementation, it was not allowed to elevate more than 14 feet. If a buffer/freeboard policy recommended a combined elevation of over 14 feet, I overrided the heightening to be 14 feet.
+
+
 ## Validation
 
 As we have seen in labs, mistakes are inevitable and can lead to misleading results.
 To minimize the risk of errors making their way into final results, it is essential to validate the implemented feature.
 Describe the validation techniques used to ensure the accuracy and reliability of your implemented feature.
 Discuss any challenges faced during the validation process and how they were addressed.
+
+```{julia}
+#| output: false
+using CSV
+using DataFrames
+using DataFramesMeta
+using Distributions
+using LaTeXStrings
+using Metaheuristics
+using Plots
+using Random
+using Unitful
+using Revise
+using HouseElevation
+using Random
+
+Plots.default(; margin=5Plots.mm)
+```
+
+```{julia}
+#| output: false
+house = let
+    haz_fl_dept = CSV.read("data/haz_fl_dept.csv", DataFrame) # read in the file
+    desc = "one story, Contents, fresh water, short duration"
+    row = @rsubset(haz_fl_dept, :Description == desc)[1, :] # select the row I want
+    area = 500u"ft^2"
+    height_above_gauge = 12u"ft"
+    House(row; area=area, height_above_gauge=height_above_gauge, value_usd=250_000)
+end
+
+# define SOWs
+
+p = ModelParams(; house=house, years=2024:2083)
+
+slr_scenarios = let
+    df = CSV.read("data/slr_oddo.csv", DataFrame)
+    [Oddo17SLR(a, b, c, tstar, cstar) for (a, b, c, tstar, cstar) in eachrow(df)]
+end
+
+function draw_surge_distribution()
+    μ = rand(Normal(5, 1))
+    σ = rand(Exponential(1.25))
+    ξ = rand(Normal(0.1, 0.05))
+    return GeneralizedExtremeValue(μ, σ, ξ)
+end
+
+function draw_discount_rate()
+    return rand(Normal(0.05, 0.03))
+end
+
+function draw_sow()
+    slr = rand(slr_scenarios)
+    surge_params = draw_surge_distribution()
+    discount = draw_discount_rate()
+    return SOW(slr, surge_params, discount)
+end
+```
+
+To validate run_sim_seq, I edited it to print out the decision to elevate and the updated elevations of the house for each iteration. I initially found a bug that I was resetting the elevation on each iteration and fixed this. I then plotted the elevations determined by run_sim_seq with the expected water level for a random SOW to make sure it made sense with the chosen policy. To do this, I made an altered run_sim_seq that returns an array containing tuples with the elevation changes made each year and the water level each year.
+
+```{julia}
+function run_sim_seq_elev(a::SeqAction, sow::SOW, p::ModelParams)
+    # get an expected storm surge value
+    storm_surges_ft = range(
+        quantile(sow.surge_dist, 0.0005); stop=quantile(sow.surge_dist, 0.9995), length=130
+    )
+    pdf_values = pdf.(sow.surge_dist, storm_surges_ft) # probability of each
+    exp_surge = sum(storm_surges_ft .* pdf_values)/sum(pdf_values) # weighted average to use for heightening heuristic
+    house_height = p.house.height_above_gauge_ft
+
+    annual_height_water = map(p.years) do year 
+        # first, we need to determine the actual elevation height based on our policy
+        slr_ft = sow.slr(year)
+        exp_depth = slr_ft + exp_surge
+        # only heighten if we expect to be below the buffer height
+        if a.buff < house_height - exp_depth
+            Δh = 0
+        else
+            Δh = exp_depth - (house_height - a.buff) + a.free
+            # note that we can't elevate more than 14 feet
+            if Δh > 14.0
+                Δh = 14.0
+            end
+        end
+        house_height += Δh
+        tup = tuple(house_height, exp_depth)
+    end
+    return annual_height_water
+end
+```
+
+I used this function to plot how the house elevation changes with expected water level. The vertical line is placed where the buffer height requirement is violated. As you can see from the plot, this is indeed where the model function predicts that elevation is required. For a 12 foot house with a 5 ft buffer height, a water level of 7 ft or higher requires elevation, which we do here.
+
+```{julia}
+# sample SOWs, both for validation and future optimization
+Random.seed!(987413) # random seed for repeatability
+N_SOW = 10_000
+N_SOW_opt = 10 # to start
+sows = [draw_sow() for _ in 1:N_SOW]
+sows_opt = first(sows, N_SOW_opt)
+```
+
+```{julia}
+# for this basic case, we'll assume a buffer height of 5 ft with a freeboard height of 8 ft as an easy start.
+seqaction = SeqAction([5.0, 8.0])
+sow = draw_sow()
+
+results = run_sim_seq_elev(seqaction, sow, p)
+heights, water_levels = (first.(results), last.(results))
+idx = findfirst(x -> x >= p.house.height_above_gauge_ft - seqaction.buff, water_levels) # find the first year where the water level requires an elevation, in this example when it reaches 7 ft.
+
+plot(p.years, 
+    heights;
+    xlabel="Year",
+    ylabel="House Height/Water Level (ft)",
+    yticks=round(minimum(water_levels)):1:maximum(heights),
+    label="Height of House (ft)"
+)
+
+plot!(p.years,
+    water_levels;
+    label="Water Level (ft)"
+)
+if idx !== nothing
+    vline!([p.years[idx]], label="Year requiring elevation", linestyle=:dash)
+else
+    display(plot)
+end
+```
+
+Minimal validation was done on the NPV calculation part of run_sim_seq, as it used the same approach as in run_sim. The only minor adjustment was that costs happen on a per year basis depending on whether or not we elevate. I added this functionality and discounted the costs appropriately. Some print statements ensured that costs are accrued only when a house elevation occurs. I also tested different random seeds when running the actual optimization functions, and there was little difference between results.
 
 # Results
 
@@ -79,6 +220,128 @@ Provide sufficient detail to demonstrate how the implemented feature addresses t
 Use the `#| output: false` and/or `#| echo: false` tags to hide code output and code cells in the final report except where showing the output (e.g.g, a plot) or the code (e.g., how you are sampling SOWs) adds value to the discussion.
 You may have multiple subsections of results, which you can create using `##`.
 
+I compared the results from running optimization on my method and optimization on the method from lab 6. 
+
+```{julia}
+# setup optimization
+
+# decision vars
+bounds_seq = boxconstraints(; lb=[0.0, 0.0], ub=[14.0, 14.0])
+
+# objective function
+function objective_function_seq(heights::Vector{Float64})
+    a = SeqAction(heights)
+    npvs = [run_sim_seq(a, sow, p) for sow in sows_opt]
+    return -mean(npvs)
+end
+
+bounds_og = boxconstraints(; lb=[0.0], ub=[14.0])
+# original objective function for comparison
+function objective_function_og(Δh::Vector{Float64})
+    a = Action(Δh[1])
+    npvs = [run_sim(a, sow, p) for sow in sows_opt]
+    return -mean(npvs)
+end
+```
+
+```{julia}
+#| output: false
+# make sure both optimization functions work in a simple case
+result_seq = optimize(objective_function_seq, bounds_seq)
+```
+
+```{julia}
+#| output: false
+result_og = optimize(objective_function_og, bounds_og)
+```
+
+```{julia}
+# optimize over many SOW
+N_SOW_opt = 100
+sows_opt = first(sows, N_SOW_opt)
+options = Options(; time_limit=300.0, f_tol_rel=10.0)
+algorithm = ECA(; options=options)
+```
+```{julia}
+result_seq = optimize(objective_function_seq, bounds_seq, algorithm)
+```
+
+The optimal buffer height was found to be 5.32604ft, and the optimal freeboard height was found to be 13.1781ft. These resulted in an NPV of -75228.3.
+
+
+```{julia}
+# need to repeat these for some reason when optimizing again
+options = Options(; time_limit=180.0, f_tol_rel=10.0)
+algorithm = ECA(; options=options)
+result_og = optimize(objective_function_og, bounds_og, algorithm)
+# 80637.5
+```
+
+The optimal fixed build policy was to elevate by 14 feet, with an NPV of -96203. The plot below compares this fixed policy with the sequential decision policy over 3 SOWs.
+
+
+```{julia}
+sow1 = sows_opt[25]
+sow2 = sows_opt[50]
+sow3 = sows_opt[75]
+seqaction = SeqAction([5.32604, 13.1781])
+
+results_sow1 = run_sim_seq_elev(seqaction, sow1, p)
+heights_sow1, water_levels_sow1 = (first.(results_sow1), last.(results_sow1))
+
+results_sow2 = run_sim_seq_elev(seqaction, sow2, p)
+heights_sow2, water_levels_sow2 = (first.(results_sow2), last.(results_sow2))
+
+results_sow3 = run_sim_seq_elev(seqaction, sow3, p)
+heights_sow3, water_levels_sow3 = (first.(results_sow3), last.(results_sow3))
+
+# plot all 3
+
+plot(p.years, 
+    heights_sow1;
+    xlabel="Year",
+    ylabel="House Height/Water Level (ft)",
+    yticks=6:1:26,
+    label="SOW1 House Height(ft)",
+    legend=:topright,
+    linecolor=:cyan
+)
+plot!(p.years,
+    water_levels_sow1;
+    label="SOW1 Water Level (ft)",
+    linestyle=:dash,
+    linecolor=:cyan
+)
+
+plot!(p.years, 
+    heights_sow2;
+    label="SOW2 House Height(ft)",
+    linecolor=:green
+)
+plot!(p.years,
+    water_levels_sow2;
+    label="SOW2 Water Level (ft)",
+    linestyle=:dash,
+    linecolor=:green
+)
+
+plot!(p.years, 
+    heights_sow3;
+    label="SOW3 House Height(ft)",
+    linecolor=:blue
+)
+plot!(p.years,
+    water_levels_sow3;
+    label="SOW3 Water Level (ft)",
+    linestyle=:dash,
+    linecolor=:blue
+)
+
+hline!([12.0+14.0], label="Static Build", linecolor=:black)
+```
+
+Water levels are dashed, while house heights are solid. The solid black line at the top represents the static build policy.
+
 # Conclusions
 
 ## Discussion
@@ -87,12 +350,23 @@ Analyze the implications of your results for climate risk management.
 Consider the context of the class themes and discuss how your findings contribute to the understanding of climate risk assessment.
 Identify any limitations of your approach and suggest potential improvements for future work.
 
+There is a small improvement in using the sequential decision policy over the static policy over the SOWs I studied. While my policy often continues to recommend high elevations, it also does this by responding to the current water level, allowing the potential for a delayed or lower heightening if water levels do not rise too high. By delaying heightening, future costs become discounted, so this is one possible savings source. Due to the high freeboard height, only one elevation is also generally required, which is why these policies end up being somewhat comparable.
+
+One major caveat to the sequential decision method implemented here is that it does not have any reliability criteria. The method implemented in @garner_slrise:2018 was more sophisticated and required reliability in 80% of SOWs. This is an important constraint as delaying a heightening may be a bad decision if it affects reliability.
+
+As always, I would benefit from optimizing over more SOWs. Additionally, I assume that the weighted average storm surge is a good approximation for the storm surge in each year to use in the heightening heuristic. This implicitly assumes stationarity in storm surge, limiting some of the ability of this approach to adapt to flexibility. Since we've seen in many systems that reliance on historical data may result in policies that quickly become out-dated, an improvement on this work would be to include the non-stationarity of storm surge over the course of the simulation as this would affect our expectations of water levels.
+
 ## Conclusions
 
 Summarize the key findings of your project and reiterate the significance of your implemented feature in addressing the problem statement.
 Discuss the broader implications of your work for climate risk management and the potential for further research in this area.
 
+My project found that implementing an approach that decides whether to elevate a house based on the current water level can result in more cost savings compared to a static build policy when comparing optimal solutions. This is also a more realistic decision policy as home-owners may base their choice to elevate their house on the current state of water levels affected by sea-level rise. This approach can save costs by delaying elevation expenses or elevating less than the static build policy.
+
+Some important caveats to this work are the assumption that expected storm surge is stationary. I also do not include a reliability constraint, which would improve my approach in different SOWs. Overall, this work suggests that a sequential decision process may be better than static build policies and that further improvements on risk assessment should consider such strategies.
+
 # References
 
 :::{#refs}
+
 :::

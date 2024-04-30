@@ -82,7 +82,6 @@ function run_sim_seq(a::SeqAction, sow::SOW, p::ModelParams)
     end
     # we need to unzip the array of tuples into an array of EAD and construction costs
     eads, costs = (first.(eads), last.(eads))
-
     years_idx = p.years .- minimum(p.years)
     discount_fracs = (1 - sow.discount_rate) .^ years_idx
     ead_npv = sum(eads .* discount_fracs)
