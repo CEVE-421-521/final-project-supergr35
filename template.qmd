@@ -30,7 +30,7 @@ date-format: "ddd., MMM. D"
 # See Quarto docs: https://quarto.org/docs/authoring/footnotes-and-citations.html
 # you can export your references from Zotero, EndNote, or other reference managers
 # from Zotero you'll need https://retorque.re/zotero-better-bibtex/
-references: references.bib
+bibliography: references.bib
 
 # recommended, but not required
 # you will need jupyter-cache installed
@@ -57,7 +57,9 @@ Provide a brief overview of the theoretical background related to your chosen fe
 Cite at least two relevant journal articles to support your approach (see [Quarto docs](https://quarto.org/docs/authoring/footnotes-and-citations.html) for help with citations).
 Explain how these articles contribute to the justification of your selected feature.
 
-This approach minimizes 2 objective functions: one for the investment cost of elevating our house, and one for the expected flooding damages. For my purposes, I will combine these into using NPV as an objective function as we have done in previous labs. State variables are the current state of sea level rise, and the decision variables are a buffer height and freeboard height, defined below
+Dynamic approaches to problems have shown they can improve performance when compared to static policies. We studied this in class with the parking garage example, where a solution that built more garage levels based on the projected demand was possibly more profitable than a fixed build solution. @deneufville_parkinggarage:2006 This same process has extended to environmental applications, such as in water resources planning. @herman_control:2020 Dynamic approaches allow us to deal with our future uncertainty by using new information to inform our decisions. In @garner_slrise:2018, a dynamic approach was applied to the issue of optimizing the build policy for elevating a dike. I implemented a similar process to this for our house elevation problem to both use an approach more similar to real-world decision-making and to possibly improve our performance on cost savings.
+
+The approach in @garner_slrise:2018 minimizes 2 objective functions: one for the investment cost of elevating our house, and one for the expected flooding damages. Using 2 objective functions gives a sense of the tradeoff between investment costs and damages, but I used only NPV for simplicity of comparison with our previous lab work. Additionally, the paper used several decision variables with a polynomial fit for its buffer and freeboard height policies that may be able to change over each time step. While this is a better approach than mine, I implemented an approach using only the buffer height and freeboard height as decision variables. This still means that the decision to elevate a house will be affected by the current water level, but the policy itself will not change over the course of the simulation based on the rate of sea level rise. A more complex analysis would consider these features.
 
 # Methodology
 
@@ -67,7 +69,58 @@ You should make your modifications in either the `HouseElevation` or `ParkingGar
 Detail the steps taken to implement the selected feature and integrate it into the decision-support tool.
 Include code snippets and explanations where necessary to clarify the implementation process.
 
-All of modifications are in HouseElevation. First, I edited the House struct in house.jl to be mutable so that the height may change over time, as the actual elevation change will be based on the water level and house elevation at each time step. Second, I added a SeqAction struct in core.jl to describe the buffer and freeboard height policies that will be used in a sequential run. Lastly, I added a run_sim function that takes in a SeqAction struct, and that behaves differently than the non-sequential run_sim. This is described as follows:
+All of modifications are in HouseElevation. First, I added a SeqAction struct in core.jl to describe the buffer and freeboard height policies that will be used in a sequential run. Next, I added a run_sim_seq function that takes in a SeqAction struct, and that determines the NPV of a sequential decision policy. This code snippet is below, with an explanation following.
+
+```{julia}
+#| eval: false
+#| output: false
+"""
+Run the sequential decision model for a given SeqAction and SOW
+"""
+function run_sim_seq(a::SeqAction, sow::SOW, p::ModelParams)
+    # get an expected storm surge value
+    storm_surges_ft = range(
+        quantile(sow.surge_dist, 0.0005); stop=quantile(sow.surge_dist, 0.9995), length=130
+    )
+    pdf_values = pdf.(sow.surge_dist, storm_surges_ft) # probability of each
+    exp_surge = sum(storm_surges_ft .* pdf_values)/sum(pdf_values) # weighted average to use for heightening heuristic
+    house_height = p.house.height_above_gauge_ft
+
+    eads = map(p.years) do year 
+        # first, we need to determine the actual elevation height based on our policy
+        slr_ft = sow.slr(year)
+        exp_depth = slr_ft + exp_surge
+        # only heighten if we expect to be below the buffer height
+        if a.buff < house_height - exp_depth
+            Δh = 0
+        else
+            Δh = exp_depth - (house_height - a.buff) + a.free
+            # note that we can't elevate more than 14 feet
+            if Δh > 14.0
+                Δh = 14.0
+            end
+        end
+        construction_cost = elevation_cost(p.house, Δh)
+        depth_ft_gauge = storm_surges_ft .+ slr_ft # flood at gauge including uncertainty
+        # now calculate damages for our heightening
+        depth_ft_house = depth_ft_gauge .- (house_height += Δh) # flood @ house, updating height
+        damages_frac = p.house.ddf.(depth_ft_house) ./ 100 # damage 
+        weighted_damages = damages_frac .* pdf_values # weighted damage
+        # Trapezoidal integration of weighted damages
+        ead = trapz(storm_surges_ft, weighted_damages) * p.house.value_usd
+        # each element of eads will now be a tuple of the form (damage, construction cost)
+
+        tup = tuple(ead, construction_cost)
+    end
+    # we need to unzip the array of tuples into an array of EAD and construction costs
+    eads, costs = (first.(eads), last.(eads))
+    years_idx = p.years .- minimum(p.years)
+    discount_fracs = (1 - sow.discount_rate) .^ years_idx
+    ead_npv = sum(eads .* discount_fracs)
+    costs_npv = sum(costs .* discount_fracs)
+    return -(ead_npv + costs_npv)
+end 
+```
 
 First, I calculate the expected value for storm surge, using the same samples from the storm surge distribution used in the original run_sim. Over each time step of the simulation, this value is added to the amount of sea level rise to get an expected water level for that time step. I then compare the difference between the height of the house and the expected water level with the buffer height. If the difference does not exceed the buffer height, then there is no elevation at that time step. If the buffer height is exceeded, then the heightening is equal to the freeboard height + the elevation required to reach the buffer height. Afterwards, run_sim updates the construction cost at each timestep based on the elevation required, and then calculates the expected flood damage. After iterating through all these timesteps, the discount rate is applied to all construction costs and expected annual damages and the NPV is returned.
 
@@ -76,12 +129,8 @@ Additionally, in our original implementation, it was not allowed to elevate more
 
 ## Validation
 
-As we have seen in labs, mistakes are inevitable and can lead to misleading results.
-To minimize the risk of errors making their way into final results, it is essential to validate the implemented feature.
-Describe the validation techniques used to ensure the accuracy and reliability of your implemented feature.
-Discuss any challenges faced during the validation process and how they were addressed.
-
 ```{julia}
+#| echo: false
 #| output: false
 using CSV
 using DataFrames
@@ -183,6 +232,7 @@ sows_opt = first(sows, N_SOW_opt)
 ```
 
 ```{julia}
+#| echo: false
 # for this basic case, we'll assume a buffer height of 5 ft with a freeboard height of 8 ft as an easy start.
 seqaction = SeqAction([5.0, 8.0])
 sow = draw_sow()
@@ -245,12 +295,14 @@ end
 ```
 
 ```{julia}
+#| echo: false
 #| output: false
 # make sure both optimization functions work in a simple case
 result_seq = optimize(objective_function_seq, bounds_seq)
 ```
 
 ```{julia}
+#| echo: false
 #| output: false
 result_og = optimize(objective_function_og, bounds_og)
 ```
@@ -281,6 +333,7 @@ The optimal fixed build policy was to elevate by 14 feet, with an NPV of -96203.
 
 
 ```{julia}
+#| echo: false
 sow1 = sows_opt[25]
 sow2 = sows_opt[50]
 sow3 = sows_opt[75]
@@ -346,24 +399,19 @@ Water levels are dashed, while house heights are solid. The solid black line at 
 
 ## Discussion
 
-Analyze the implications of your results for climate risk management.
-Consider the context of the class themes and discuss how your findings contribute to the understanding of climate risk assessment.
-Identify any limitations of your approach and suggest potential improvements for future work.
-
 There is a small improvement in using the sequential decision policy over the static policy over the SOWs I studied. While my policy often continues to recommend high elevations, it also does this by responding to the current water level, allowing the potential for a delayed or lower heightening if water levels do not rise too high. By delaying heightening, future costs become discounted, so this is one possible savings source. Due to the high freeboard height, only one elevation is also generally required, which is why these policies end up being somewhat comparable.
 
 One major caveat to the sequential decision method implemented here is that it does not have any reliability criteria. The method implemented in @garner_slrise:2018 was more sophisticated and required reliability in 80% of SOWs. This is an important constraint as delaying a heightening may be a bad decision if it affects reliability.
 
 As always, I would benefit from optimizing over more SOWs. Additionally, I assume that the weighted average storm surge is a good approximation for the storm surge in each year to use in the heightening heuristic. This implicitly assumes stationarity in storm surge, limiting some of the ability of this approach to adapt to flexibility. Since we've seen in many systems that reliance on historical data may result in policies that quickly become out-dated, an improvement on this work would be to include the non-stationarity of storm surge over the course of the simulation as this would affect our expectations of water levels.
 
-## Conclusions
+My approach also only used NPV as an objective function and only optimized the static policy for a buffer height and freeboard height. A more sophisticated approach would include the ability to change these policies at each time step, weighting sea level rise as in @garner_slrise:2018. Additionally, splitting NPV into construction costs and flood damages would result in an exploration of trade-offs between the two. In this project, I only used NPV as an objective function to more easily compare with our previous optimization of NPV. 
 
-Summarize the key findings of your project and reiterate the significance of your implemented feature in addressing the problem statement.
-Discuss the broader implications of your work for climate risk management and the potential for further research in this area.
+## Conclusions
 
 My project found that implementing an approach that decides whether to elevate a house based on the current water level can result in more cost savings compared to a static build policy when comparing optimal solutions. This is also a more realistic decision policy as home-owners may base their choice to elevate their house on the current state of water levels affected by sea-level rise. This approach can save costs by delaying elevation expenses or elevating less than the static build policy.
 
-Some important caveats to this work are the assumption that expected storm surge is stationary. I also do not include a reliability constraint, which would improve my approach in different SOWs. Overall, this work suggests that a sequential decision process may be better than static build policies and that further improvements on risk assessment should consider such strategies.
+Some important caveats to this work are the assumption that expected storm surge is stationary. I also do not include a reliability constraint, which would improve my approach in different SOWs. Additionally, more complex models can include the trade-offs between investment costs and damages and also allow the buffer and freeboard height policies to vary with the expected changes in sea level rise. Overall, this work suggests that a sequential decision process may be better than static build policies and that further improvements on risk assessment should consider such strategies. 
 
 # References
 

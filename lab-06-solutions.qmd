@@ -143,6 +143,7 @@ We can throw this straight into the `optimize` function:
 
 ```{julia}
 result = optimize(objective_function, bounds)
+# 80168.32817561974
 ```
 
 We can view the minimum of the objective function with
@@ -184,7 +185,7 @@ This will make our results more reproducible.
 We can then vary the seed to see how sensitive our results are to the random seed.
 
 ```{julia}
-Random.seed!(421521)
+Random.seed!(825346)
 result = optimize(objective_function, bounds, algorithm)
 ```
 
